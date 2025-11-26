@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>6DoF Fixed-Wing Flight Simulator (HTML 단일 파일 예제)</title>
+  <style>
+    /* 기본 스타일 */
+    html, body { margin: 0; padding: 0; overflow: hidden; width: 100%; height: 100%; font-family: 'Segoe UI', Arial, sans-serif; background: #87ceeb; }
+    #hud {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      color: #fff;
+      font-size: 14px;
+      background: rgba(0, 0, 0, 0.35);
+      padding: 10px 12px;
+      border-radius: 8px;
+      line-height: 1.4;
+      min-width: 260px;
+    }
+    #help {
+      position: absolute;
+      bottom: 10px;
+      left: 10px;
+      color: #fff;
+      font-size: 13px;
+      background: rgba(0, 0, 0, 0.35);
+      padding: 6px 10px;
+      border-radius: 6px;
+      line-height: 1.5;
+    }
+    a { color: #9cf; }
+  </style>
+</head>
+<body>
+  <div id="hud">Loading...</div>
+  <div id="help">
+    Controls — Roll: A / D, Pitch: W / S, Yaw: Q / E, Throttle: Shift / Ctrl<br />
+    Reset: R · Pause: Space
+  </div>
+
+  <script>
+    // three.js loader with fallback CDN to avoid hanging if one host is unreachable
+    const THREE_CDN_URLS = [
+      'https://cdn.jsdelivr.net/npm/three@0.164/build/three.min.js',
+      'https://unpkg.com/three@0.164.0/build/three.min.js'
+    ];
+
+    let threeLoaded = false;
+    function loadThreeAndStart() {
+      const hud = document.getElementById('hud');
+      const tryLoad = (index) => {
+        if (index >= THREE_CDN_URLS.length) {
+          hud.textContent = 'three.js를 불러오지 못했습니다. 네트워크를 확인하거나 CDN을 허용해 주세요.';
+          console.error('Unable to load three.js from all fallbacks');
+          return;
+        }
+        const script = document.createElement('script');
+        script.src = THREE_CDN_URLS[index];
+        script.onload = () => {
+          if (threeLoaded) return;
+          threeLoaded = true;
+          console.log(`three.js loaded from ${THREE_CDN_URLS[index]}`);
+          bootSimulator();
+        };
+        script.onerror = () => {
+          console.warn(`Failed to load three.js from ${THREE_CDN_URLS[index]}, trying fallback...`);
+          tryLoad(index + 1);
+        };
+        document.head.appendChild(script);
+      };
+      tryLoad(0);
+    }
+
+    // Simulator code is declared first; bootSimulator() runs only after three.js is ready
+    // ============================================================================
+    // Nonlinear 6DoF Fixed-Wing Dynamics Example (NED frame, body axes: x fwd, y right, z down)
+    // Save this file as index.html and open in Chrome: no build tools required.
+    // Constants below are representative small UAV values; tweak them to change behavior:
+    // - Increase mass or inertia: aircraft feels heavier, slower response.
+    // - Increase CL_alpha or Cm_alpha magnitude: stronger lift or pitch stability.
+    // - Increase control derivatives (Cl_delta_a, Cm_delta_e, Cn_delta_r): more control authority.
+    // - Increase T_MAX or throttle: better acceleration and climb.
+    // - Adjust CD0/K: changes drag polar and cruise speed.
+    // ============================================================================
+
+    // ------------------------------
+    // Physical constants (SI units)
+    // ------------------------------
+    const g = 9.81;                  // [m/s^2] gravity
+    const mass = 12.0;               // [kg] small fixed-wing UAV mass
+    const Ix = 1.1;                  // [kg·m^2]
+    const Iy = 1.6;                  // [kg·m^2]
+    const Iz = 2.0;                  // [kg·m^2]
+    const Ixz = 0.05;                // [kg·m^2] product of inertia
+    const S = 0.9;                   // [m^2] wing area
+    const b = 2.2;                   // [m] span
+    const cBar = 0.45;               // [m] mean aerodynamic chord
+    const rho = 1.225;               // [kg/m^3] sea-level air density
+    const V_TRIM = 22.0;             // [m/s] nominal cruise speed
+    const H_TRIM = 100.0;            // [m] nominal cruise altitude (positive up; NED uses negative z)
+    const T_MAX = 45.0;              // [N] maximum thrust (body +x direction)
+
+    // ------------------------------
+    // Aerodynamic derivatives (typical small UAV-ish example values)
+    // ------------------------------
+    const CL0 = 0.28;
+    const CL_alpha = 4.8;            // [1/rad]
+    const CL_q = 7.0;                // pitch rate damping
+    const CL_delta_e = 0.9;          // elevator effectiveness
+
+    const CD0 = 0.04;
+    const K = 0.045;                 // induced drag factor (CD = CD0 + K * CL^2)
+
+    const CY_beta = -0.9;
+    const CY_p = -0.5;
+    const CY_r = 0.4;
+    const CY_delta_a = 0.08;
+    const CY_delta_r = 0.17;
+
+    const Cl_beta = -0.12;
+    const Cl_p = -0.7;
+    const Cl_r = 0.25;
+    const Cl_delta_a = 0.11;
+    const Cl_delta_r = 0.02;
+
+    const Cm0 = -0.02;
+    const Cm_alpha = -1.0;           // negative for static stability
+    const Cm_q = -10.0;
+    const Cm_delta_e = -1.1;
+
+    const Cn_beta = 0.2;
+    const Cn_p = -0.06;
+    const Cn_r = -0.2;
+    const Cn_delta_a = 0.02;
+    const Cn_delta_r = -0.08;
+
+    // Control limits (radians) and throttle
+    const ELEV_LIMIT = 25 * Math.PI / 180;
+    const AIL_LIMIT = 20 * Math.PI / 180;
+    const RUD_LIMIT = 25 * Math.PI / 180;
+    const CONTROL_SMOOTH = 0.12; // [s] first-order filter time constant
+
+    // Utility helpers
+    const toDeg = (rad) => rad * 180 / Math.PI;
+    const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+
+    // ------------------------------
+    // Simulation state
+    // ------------------------------
+    let planeState = null; // holds dynamic variables
+    let controls = null;   // target + filtered (normalized) controls
+    let lastTime = null;
+    let paused = false;
+
+    // THREE.js objects
+    let renderer, scene, camera;
+    let planeMesh, ground;
+
+    function initPlaneState() {
+      // Near-trim initial condition (NED frame: x North, y East, z Down)
+      const alpha0 = 5 * Math.PI / 180; // 5 deg AoA
+      const V0 = V_TRIM;
+      const u0 = V0 * Math.cos(alpha0);
+      const w0 = V0 * Math.sin(alpha0);
+
+      planeState = {
+        u: u0, v: 0, w: w0,
+        p: 0, q: 0, r: 0,
+        phi: 0, theta: alpha0, psi: 0,
+        x: 0, y: 0, z: -H_TRIM // NED: altitude up => negative z
+      };
+
+      controls = {
+        target: { delta_e: 0, delta_a: 0, delta_r: 0, throttle: 0.55 },
+        filtered: { delta_e: 0, delta_a: 0, delta_r: 0, throttle: 0.55 },
+        current: { delta_e: 0, delta_a: 0, delta_r: 0, throttle: 0.55 } // radians & [0,1]
+      };
+    }
+
+    // ------------------------------
+    // THREE.js scene setup
+    // ------------------------------
+    function initScene() {
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      document.body.appendChild(renderer.domElement);
+
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x87ceeb);
+
+      // Simple sun light
+      const light = new THREE.DirectionalLight(0xffffff, 1.0);
+      light.position.set(5, 10, 5);
+      scene.add(light);
+      scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+
+      // Ground plane (very large)
+      const groundGeo = new THREE.PlaneGeometry(2000, 2000, 20, 20);
+      const groundMat = new THREE.MeshLambertMaterial({ color: 0x77aa55, side: THREE.DoubleSide });
+      ground = new THREE.Mesh(groundGeo, groundMat);
+      ground.rotation.x = -Math.PI / 2; // make it horizontal (y up)
+      scene.add(ground);
+
+      // Simple aircraft representation (fuselage + wings + tail)
+      const bodyMat = new THREE.MeshPhongMaterial({ color: 0xff5522, flatShading: true });
+      const wingMat = new THREE.MeshPhongMaterial({ color: 0x444444, flatShading: true });
+      const fuseGeo = new THREE.BoxGeometry(1.2, 0.18, 0.18);
+      const fuse = new THREE.Mesh(fuseGeo, bodyMat);
+
+      const wingGeo = new THREE.BoxGeometry(0.1, 0.02, 1.4);
+      const wing = new THREE.Mesh(wingGeo, wingMat);
+      wing.position.set(0, 0, 0);
+
+      const tailGeo = new THREE.BoxGeometry(0.35, 0.02, 0.5);
+      const tail = new THREE.Mesh(tailGeo, wingMat);
+      tail.position.set(-0.45, 0, 0);
+
+      const tailVertGeo = new THREE.BoxGeometry(0.02, 0.25, 0.2);
+      const tailVert = new THREE.Mesh(tailVertGeo, wingMat);
+      tailVert.position.set(-0.45, 0.12, 0);
+
+      planeMesh = new THREE.Group();
+      planeMesh.add(fuse);
+      planeMesh.add(wing);
+      planeMesh.add(tail);
+      planeMesh.add(tailVert);
+      scene.add(planeMesh);
+
+      // Camera setup (chase view)
+      camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 5000);
+      camera.position.set(-10, 5, 10);
+      camera.lookAt(0, 0, 0);
+
+      window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+    }
+
+    function initHUD() {
+      updateHUD();
+    }
+
+    function setupInput() {
+      const step = 0.2; // per key press change for control targets (normalized -1..1)
+      window.addEventListener('keydown', (e) => {
+        if (e.repeat) return;
+        switch (e.key.toLowerCase()) {
+          case 'w': controls.target.delta_e = clamp(controls.target.delta_e - step, -1, 1); break; // nose down
+          case 's': controls.target.delta_e = clamp(controls.target.delta_e + step, -1, 1); break; // nose up
+          case 'a': controls.target.delta_a = clamp(controls.target.delta_a - step, -1, 1); break; // roll left
+          case 'd': controls.target.delta_a = clamp(controls.target.delta_a + step, -1, 1); break; // roll right
+          case 'q': controls.target.delta_r = clamp(controls.target.delta_r - step, -1, 1); break; // yaw left
+          case 'e': controls.target.delta_r = clamp(controls.target.delta_r + step, -1, 1); break; // yaw right
+          case 'shift':
+          case 'shiftleft':
+            controls.target.throttle = clamp(controls.target.throttle + 0.05, 0, 1); break;
+          case 'control':
+          case 'controlleft':
+            controls.target.throttle = clamp(controls.target.throttle - 0.05, 0, 1); break;
+          case 'r': initPlaneState(); break;
+          case ' ': paused = !paused; break;
+        }
+      });
+    }
+
+    // ------------------------------
+    // Aerodynamics helper functions
+    // ------------------------------
+    function aerodynamicState(state) {
+      const { u, v, w } = state;
+      const V = Math.max(0.1, Math.sqrt(u*u + v*v + w*w));
+      const alpha = Math.atan2(w, u);
+      const beta = clamp(Math.asin(v / V), -Math.PI/2 + 0.001, Math.PI/2 - 0.001);
+      const qBar = 0.5 * rho * V * V;
+      return { V, alpha, beta, qBar };
+    }
+
+    function aerodynamicCoefficients(state, control) {
+      const { q, p, r } = state;
+      const { V, alpha, beta } = aerodynamicState(state);
+      const delta_e = clamp(control.delta_e, -ELEV_LIMIT, ELEV_LIMIT);
+      const delta_a = clamp(control.delta_a, -AIL_LIMIT, AIL_LIMIT);
+      const delta_r = clamp(control.delta_r, -RUD_LIMIT, RUD_LIMIT);
+      const twoV = 2 * V;
+
+      const CL = CL0 + CL_alpha * alpha + CL_q * (cBar / twoV) * q + CL_delta_e * delta_e;
+      const CD = CD0 + K * CL * CL;
+      const CY = CY_beta * beta + CY_p * (b / twoV) * p + CY_r * (b / twoV) * r + CY_delta_a * delta_a + CY_delta_r * delta_r;
+      const Cl = Cl_beta * beta + Cl_p * (b / twoV) * p + Cl_r * (b / twoV) * r + Cl_delta_a * delta_a + Cl_delta_r * delta_r;
+      const Cm = Cm0 + Cm_alpha * alpha + Cm_q * (cBar / twoV) * q + Cm_delta_e * delta_e;
+      const Cn = Cn_beta * beta + Cn_p * (b / twoV) * p + Cn_r * (b / twoV) * r + Cn_delta_a * delta_a + Cn_delta_r * delta_r;
+
+      return { CL, CD, CY, Cl, Cm, Cn };
+    }
+
+    function forcesAndMoments(state, control) {
+      const { u, v, w, phi, theta, psi } = state;
+      const { V, alpha, beta, qBar } = aerodynamicState(state);
+      const coeff = aerodynamicCoefficients(state, control);
+
+      // Aerodynamic forces (wind axes -> body axes)
+      const Lift = coeff.CL * qBar * S; // positive upward (opposes body +z)
+      const Drag = coeff.CD * qBar * S; // positive opposite to airflow
+      const Side = coeff.CY * qBar * S; // positive to body +y (right)
+
+      // Convert Lift/Drag to body axes using AoA (ignore small sideslip effect on X/Z)
+      const X_aero = -(Drag * Math.cos(alpha) + Lift * Math.sin(alpha));
+      const Z_aero = -Lift * Math.cos(alpha) - Drag * Math.sin(alpha);
+      const Y_aero = Side;
+
+      // Moments in body axes
+      const L_m = coeff.Cl * qBar * S * b;
+      const M_m = coeff.Cm * qBar * S * cBar;
+      const N_m = coeff.Cn * qBar * S * b;
+
+      // Thrust (body +x)
+      const thrust = T_MAX * clamp(control.throttle, 0, 1);
+
+      // Gravity in body frame: g in NED is [0,0,g]; transform inertial->body using Euler angles
+      const gBody = inertialToBody([0, 0, g], phi, theta, psi);
+      const X = X_aero + thrust + mass * gBody[0];
+      const Y = Y_aero + mass * gBody[1];
+      const Z = Z_aero + mass * gBody[2];
+
+      return { X, Y, Z, L_m, M_m, N_m, V, alpha, beta, thrust };
+    }
+
+    // ------------------------------
+    // Coordinate transforms
+    // ------------------------------
+    function bodyToInertial(vec, phi, theta, psi) {
+      // R_b2n (body -> NED) rotation matrix using 3-2-1 Euler (phi-roll, theta-pitch, psi-yaw)
+      const cphi = Math.cos(phi), sphi = Math.sin(phi);
+      const cth = Math.cos(theta), sth = Math.sin(theta);
+      const cpsi = Math.cos(psi), spsi = Math.sin(psi);
+
+      const R = [
+        [ cth * cpsi,                       cth * spsi,                      -sth ],
+        [ sphi * sth * cpsi - cphi * spsi,  sphi * sth * spsi + cphi * cpsi, sphi * cth ],
+        [ cphi * sth * cpsi + sphi * spsi,  cphi * sth * spsi - sphi * cpsi, cphi * cth ]
+      ];
+
+      return [
+        R[0][0]*vec[0] + R[0][1]*vec[1] + R[0][2]*vec[2],
+        R[1][0]*vec[0] + R[1][1]*vec[1] + R[1][2]*vec[2],
+        R[2][0]*vec[0] + R[2][1]*vec[1] + R[2][2]*vec[2]
+      ];
+    }
+
+    function inertialToBody(vec, phi, theta, psi) {
+      // transpose of bodyToInertial
+      const cphi = Math.cos(phi), sphi = Math.sin(phi);
+      const cth = Math.cos(theta), sth = Math.sin(theta);
+      const cpsi = Math.cos(psi), spsi = Math.sin(psi);
+
+      const R = [
+        [ cth * cpsi,                       cth * spsi,                      -sth ],
+        [ sphi * sth * cpsi - cphi * spsi,  sphi * sth * spsi + cphi * cpsi, sphi * cth ],
+        [ cphi * sth * cpsi + sphi * spsi,  cphi * sth * spsi - sphi * cpsi, cphi * cth ]
+      ];
+
+      return [
+        R[0][0]*vec[0] + R[1][0]*vec[1] + R[2][0]*vec[2],
+        R[0][1]*vec[0] + R[1][1]*vec[1] + R[2][1]*vec[2],
+        R[0][2]*vec[0] + R[1][2]*vec[1] + R[2][2]*vec[2]
+      ];
+    }
+
+    // ------------------------------
+    // Equations of motion
+    // ------------------------------
+    function derivatives(state, control) {
+      const { u, v, w, p, q, r, phi, theta, psi } = state;
+      const forces = forcesAndMoments(state, control);
+      const { X, Y, Z, L_m, M_m, N_m } = forces;
+
+      // Translational dynamics (body frame)
+      const u_dot = r * v - q * w + X / mass;
+      const v_dot = p * w - r * u + Y / mass;
+      const w_dot = q * u - p * v + Z / mass;
+
+      // Rotational dynamics with products of inertia
+      const denom = Ix * Iz - Ixz * Ixz;
+      const p_dot = (Ixz * (Ix - Iy + Iz) * p * q + (Iy * (Iy - Iz) + Ixz * Ixz) * q * r + Ix * L_m + Ixz * N_m) / denom;
+      const r_dot = ((Ix * (Ix - Iy + Iz) * p * q - (Ix * (Iy - Ix) + Ixz * Ixz) * q * r + Ixz * L_m + Iz * N_m) / denom);
+      const q_dot = (M_m / Iy) + ((Iz - Ix) / Iy) * p * r - (Ixz / Iy) * (p * p - r * r);
+
+      // Euler angle rates
+      const phi_dot = p + Math.tan(theta) * (q * Math.sin(phi) + r * Math.cos(phi));
+      const theta_dot = q * Math.cos(phi) - r * Math.sin(phi);
+      const psi_dot = (q * Math.sin(phi) + r * Math.cos(phi)) / Math.cos(theta);
+
+      // Position rates (NED) from body velocities
+      const velNED = bodyToInertial([u, v, w], phi, theta, psi);
+      const x_dot = velNED[0];
+      const y_dot = velNED[1];
+      const z_dot = velNED[2];
+
+      return { u_dot, v_dot, w_dot, p_dot, q_dot, r_dot, phi_dot, theta_dot, psi_dot, x_dot, y_dot, z_dot };
+    }
+
+    // RK4 integrator for the state object
+    function integrateRK4(state, control, dt) {
+      const k1 = derivatives(state, control);
+      const s2 = addState(state, scaleDeriv(k1, dt/2));
+      const k2 = derivatives(s2, control);
+      const s3 = addState(state, scaleDeriv(k2, dt/2));
+      const k3 = derivatives(s3, control);
+      const s4 = addState(state, scaleDeriv(k3, dt));
+      const k4 = derivatives(s4, control);
+
+      const newState = {};
+      for (const key of Object.keys(state)) {
+        newState[key] = state[key] + (dt/6) * (k1[key + '_dot'] + 2*k2[key + '_dot'] + 2*k3[key + '_dot'] + k4[key + '_dot']);
+      }
+      return newState;
+    }
+
+    function addState(state, deriv) {
+      const result = {};
+      for (const key of Object.keys(state)) {
+        result[key] = state[key] + (deriv[key + '_dot'] || 0);
+      }
+      return result;
+    }
+
+    function scaleDeriv(deriv, factor) {
+      const scaled = {};
+      for (const key of Object.keys(deriv)) {
+        if (key.endsWith('_dot')) scaled[key] = deriv[key] * factor; else scaled[key] = deriv[key];
+      }
+      return scaled;
+    }
+
+    // ------------------------------
+    // Simulation loop
+    // ------------------------------
+    function updateControls(dt) {
+      const tau = CONTROL_SMOOTH;
+      const alpha = clamp(dt / Math.max(tau, dt + 1e-6), 0, 1);
+
+      // Low-pass filter normalized commands
+      controls.filtered.delta_e += (controls.target.delta_e - controls.filtered.delta_e) * alpha;
+      controls.filtered.delta_a += (controls.target.delta_a - controls.filtered.delta_a) * alpha;
+      controls.filtered.delta_r += (controls.target.delta_r - controls.filtered.delta_r) * alpha;
+      controls.filtered.throttle += (controls.target.throttle - controls.filtered.throttle) * alpha;
+
+      // Convert to physical deflections (radians) and clamp
+      controls.current.delta_e = clamp(controls.filtered.delta_e, -1, 1) * ELEV_LIMIT;
+      controls.current.delta_a = clamp(controls.filtered.delta_a, -1, 1) * AIL_LIMIT;
+      controls.current.delta_r = clamp(controls.filtered.delta_r, -1, 1) * RUD_LIMIT;
+      controls.current.throttle = clamp(controls.filtered.throttle, 0, 1);
+    }
+
+    function stepPhysics(dt) {
+      updateControls(dt);
+      planeState = integrateRK4(planeState, controls.current, dt);
+    }
+
+    function updateGraphicsFromState() {
+      // Map NED (x North, y East, z Down) to Three.js world (X right, Y up, Z forward)
+      const posWorld = new THREE.Vector3(
+        planeState.y,       // East -> +X
+        -planeState.z,      // Down -> -Y (so altitude is +Y)
+        -planeState.x       // North -> -Z so forward along -Z when heading north
+      );
+      planeMesh.position.copy(posWorld);
+
+      // Orientation: R_b2n then to world mapping
+      const Rbn = rotationBodyToNED(planeState.phi, planeState.theta, planeState.psi);
+      const M = new THREE.Matrix4();
+      // Mapping matrix from NED to world (Three): [ [0,0,-1],[1,0,0],[0,-1,0] ]
+      const map = new THREE.Matrix3();
+      map.set(0,0, -1,
+              1,0,  0,
+              0,-1, 0);
+      // Rbw = map * Rbn
+      const combined = new THREE.Matrix3();
+      combined.multiplyMatrices(map, Rbn);
+      M.set(
+        combined.elements[0], combined.elements[3], combined.elements[6], 0,
+        combined.elements[1], combined.elements[4], combined.elements[7], 0,
+        combined.elements[2], combined.elements[5], combined.elements[8], 0,
+        0, 0, 0, 1
+      );
+      planeMesh.setRotationFromMatrix(M);
+
+      // Camera chase view
+      const behind = new THREE.Vector3(-12, 5, 12);
+      behind.applyMatrix3(combined);
+      camera.position.copy(posWorld.clone().add(behind));
+      camera.lookAt(posWorld);
+    }
+
+    function rotationBodyToNED(phi, theta, psi) {
+      const cphi = Math.cos(phi), sphi = Math.sin(phi);
+      const cth = Math.cos(theta), sth = Math.sin(theta);
+      const cpsi = Math.cos(psi), spsi = Math.sin(psi);
+
+      const R = new THREE.Matrix3();
+      R.set(
+        cth * cpsi,                       cth * spsi,                      -sth,
+        sphi * sth * cpsi - cphi * spsi,  sphi * sth * spsi + cphi * cpsi, sphi * cth,
+        cphi * sth * cpsi + sphi * spsi,  cphi * sth * spsi - sphi * cpsi, cphi * cth
+      );
+      return R;
+    }
+
+    function updateHUD() {
+      const { V, alpha, beta } = aerodynamicState(planeState);
+      const hud = document.getElementById('hud');
+      hud.innerHTML = `
+        <strong>6DoF Fixed-Wing HUD</strong><br>
+        Airspeed: ${(V).toFixed(1)} m/s<br>
+        Altitude: ${(-planeState.z).toFixed(1)} m<br>
+        Pitch: ${toDeg(planeState.theta).toFixed(1)}°<br>
+        Roll: ${toDeg(planeState.phi).toFixed(1)}°<br>
+        Yaw: ${toDeg(planeState.psi).toFixed(1)}°<br>
+        Alpha: ${toDeg(alpha).toFixed(2)}°  Beta: ${toDeg(beta).toFixed(2)}°<br>
+        Throttle: ${(controls.current.throttle * 100).toFixed(0)} %<br>
+      `;
+    }
+
+    function animate(timestamp) {
+      if (lastTime === null) lastTime = timestamp;
+      const dt = Math.min(0.05, (timestamp - lastTime) / 1000); // clamp for stability
+      lastTime = timestamp;
+
+      if (!paused) {
+        stepPhysics(dt);
+        updateGraphicsFromState();
+        updateHUD();
+      }
+
+      renderer.render(scene, camera);
+      requestAnimationFrame(animate);
+    }
+
+    // ------------------------------
+    // Boot
+    // ------------------------------
+    function bootSimulator() {
+      if (typeof THREE === 'undefined') {
+        const hud = document.getElementById('hud');
+        hud.textContent = 'three.js를 불러오지 못했습니다. 네트워크 연결 또는 CDN 접근을 확인하세요.';
+        return;
+      }
+      initPlaneState();
+      initScene();
+      initHUD();
+      setupInput();
+      requestAnimationFrame(animate);
+    }
+
+    document.addEventListener('DOMContentLoaded', loadThreeAndStart);
+  </script>
+</body>
+</html>
