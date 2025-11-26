@@ -39,40 +39,9 @@
     Reset: R · Pause: Space
   </div>
 
+  <!-- three.js CDN (r164 기준) -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.164/build/three.min.js"></script>
   <script>
-    // three.js loader with fallback CDN to avoid hanging if one host is unreachable
-    const THREE_CDN_URLS = [
-      'https://cdn.jsdelivr.net/npm/three@0.164/build/three.min.js',
-      'https://unpkg.com/three@0.164.0/build/three.min.js'
-    ];
-
-    let threeLoaded = false;
-    function loadThreeAndStart() {
-      const hud = document.getElementById('hud');
-      const tryLoad = (index) => {
-        if (index >= THREE_CDN_URLS.length) {
-          hud.textContent = 'three.js를 불러오지 못했습니다. 네트워크를 확인하거나 CDN을 허용해 주세요.';
-          console.error('Unable to load three.js from all fallbacks');
-          return;
-        }
-        const script = document.createElement('script');
-        script.src = THREE_CDN_URLS[index];
-        script.onload = () => {
-          if (threeLoaded) return;
-          threeLoaded = true;
-          console.log(`three.js loaded from ${THREE_CDN_URLS[index]}`);
-          bootSimulator();
-        };
-        script.onerror = () => {
-          console.warn(`Failed to load three.js from ${THREE_CDN_URLS[index]}, trying fallback...`);
-          tryLoad(index + 1);
-        };
-        document.head.appendChild(script);
-      };
-      tryLoad(0);
-    }
-
-    // Simulator code is declared first; bootSimulator() runs only after three.js is ready
     // ============================================================================
     // Nonlinear 6DoF Fixed-Wing Dynamics Example (NED frame, body axes: x fwd, y right, z down)
     // Save this file as index.html and open in Chrome: no build tools required.
@@ -542,20 +511,11 @@
     // ------------------------------
     // Boot
     // ------------------------------
-    function bootSimulator() {
-      if (typeof THREE === 'undefined') {
-        const hud = document.getElementById('hud');
-        hud.textContent = 'three.js를 불러오지 못했습니다. 네트워크 연결 또는 CDN 접근을 확인하세요.';
-        return;
-      }
-      initPlaneState();
-      initScene();
-      initHUD();
-      setupInput();
-      requestAnimationFrame(animate);
-    }
-
-    document.addEventListener('DOMContentLoaded', loadThreeAndStart);
+    initPlaneState();
+    initScene();
+    initHUD();
+    setupInput();
+    requestAnimationFrame(animate);
   </script>
 </body>
 </html>
